@@ -3,7 +3,8 @@ from .client.session_group import ClientSessionGroup
 from .client.stdio import StdioServerParameters, stdio_client
 from .server.session import ServerSession
 from .server.stdio import stdio_server
-from .shared.exceptions import McpError
+from .shared.exceptions import McpError, UrlElicitationRequiredError
+from .shared.proxy import mcp_proxy
 from .types import (
     CallToolRequest,
     ClientCapabilities,
@@ -41,7 +42,11 @@ from .types import (
     ResourcesCapability,
     ResourceUpdatedNotification,
     RootsCapability,
+    SamplingCapability,
+    SamplingContextCapability,
     SamplingMessage,
+    SamplingMessageContentBlock,
+    SamplingToolsCapability,
     ServerCapabilities,
     ServerNotification,
     ServerRequest,
@@ -50,7 +55,10 @@ from .types import (
     StopReason,
     SubscribeRequest,
     Tool,
+    ToolChoice,
+    ToolResultContent,
     ToolsCapability,
+    ToolUseContent,
     UnsubscribeRequest,
 )
 from .types import (
@@ -65,6 +73,7 @@ __all__ = [
     "ClientResult",
     "ClientSession",
     "ClientSessionGroup",
+    "CompleteRequest",
     "CreateMessageRequest",
     "CreateMessageResult",
     "ErrorData",
@@ -77,6 +86,7 @@ __all__ = [
     "InitializedNotification",
     "JSONRPCError",
     "JSONRPCRequest",
+    "JSONRPCResponse",
     "ListPromptsRequest",
     "ListPromptsResult",
     "ListResourcesRequest",
@@ -85,18 +95,23 @@ __all__ = [
     "LoggingLevel",
     "LoggingMessageNotification",
     "McpError",
+    "mcp_proxy",
     "Notification",
     "PingRequest",
     "ProgressNotification",
     "PromptsCapability",
     "ReadResourceRequest",
     "ReadResourceResult",
+    "Resource",
     "ResourcesCapability",
     "ResourceUpdatedNotification",
-    "Resource",
     "RootsCapability",
+    "SamplingCapability",
+    "SamplingContextCapability",
     "SamplingMessage",
+    "SamplingMessageContentBlock",
     "SamplingRole",
+    "SamplingToolsCapability",
     "ServerCapabilities",
     "ServerNotification",
     "ServerRequest",
@@ -107,10 +122,12 @@ __all__ = [
     "StopReason",
     "SubscribeRequest",
     "Tool",
+    "ToolChoice",
+    "ToolResultContent",
     "ToolsCapability",
+    "ToolUseContent",
     "UnsubscribeRequest",
+    "UrlElicitationRequiredError",
     "stdio_client",
     "stdio_server",
-    "CompleteRequest",
-    "JSONRPCResponse",
 ]

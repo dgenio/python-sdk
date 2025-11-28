@@ -2,26 +2,39 @@
 Tests for refactored OAuth client authentication implementation.
 """
 
+import base64
+import json
 import time
 from unittest import mock
+from urllib.parse import unquote
 
 import httpx
 import pytest
 from inline_snapshot import Is, snapshot
 from pydantic import AnyHttpUrl, AnyUrl
 
-from mcp.client.auth import OAuthClientProvider, PKCEParameters
+from mcp.client.auth import OAuthClientProvider, OAuthRegistrationError, PKCEParameters
 from mcp.client.auth.utils import (
     build_oauth_authorization_server_metadata_discovery_urls,
     build_protected_resource_metadata_discovery_urls,
+    create_client_info_from_metadata_url,
+    create_client_registration_request,
     create_oauth_metadata_request,
     extract_field_from_www_auth,
     extract_resource_metadata_from_www_auth,
     extract_scope_from_www_auth,
     get_client_metadata_scopes,
     handle_registration_response,
+    is_valid_client_metadata_url,
+    should_use_client_metadata_url,
 )
-from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken, ProtectedResourceMetadata
+from mcp.shared.auth import (
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthMetadata,
+    OAuthToken,
+    ProtectedResourceMetadata,
+)
 
 
 class MockTokenStorage:
@@ -593,6 +606,74 @@ class TestOAuthFallback:
         assert request is None
 
     @pytest.mark.anyio
+    async def test_register_client_explicit_auth_method(self, mock_storage: MockTokenStorage):
+        """Test that explicitly set token_endpoint_auth_method is used without auto-selection."""
+
+        async def redirect_handler(url: str) -> None:
+            pass  # pragma: no cover
+
+        async def callback_handler() -> tuple[str, str | None]:
+            return "test_auth_code", "test_state"  # pragma: no cover
+
+        # Create client metadata with explicit auth method
+        explicit_metadata = OAuthClientMetadata(
+            client_name="Test Client",
+            client_uri=AnyHttpUrl("https://example.com"),
+            redirect_uris=[AnyUrl("http://localhost:3030/callback")],
+            scope="read write",
+            token_endpoint_auth_method="client_secret_basic",
+        )
+        provider = OAuthClientProvider(
+            server_url="https://api.example.com/v1/mcp",
+            client_metadata=explicit_metadata,
+            storage=mock_storage,
+            redirect_handler=redirect_handler,
+            callback_handler=callback_handler,
+        )
+
+        request = await provider._register_client()
+        assert request is not None
+
+        body = json.loads(request.content)
+        # Should use the explicitly set method, not auto-select
+        assert body["token_endpoint_auth_method"] == "client_secret_basic"
+
+    @pytest.mark.anyio
+    async def test_register_client_none_auth_method_with_server_metadata(self, oauth_provider: OAuthClientProvider):
+        """Test that token_endpoint_auth_method=None selects from server's supported methods."""
+        # Set server metadata with specific supported methods
+        oauth_provider.context.oauth_metadata = OAuthMetadata(
+            issuer=AnyHttpUrl("https://auth.example.com"),
+            authorization_endpoint=AnyHttpUrl("https://auth.example.com/authorize"),
+            token_endpoint=AnyHttpUrl("https://auth.example.com/token"),
+            token_endpoint_auth_methods_supported=["client_secret_post"],
+        )
+        # Ensure client_metadata has None for token_endpoint_auth_method
+
+        request = await oauth_provider._register_client()
+        assert request is not None
+
+        body = json.loads(request.content)
+        assert body["token_endpoint_auth_method"] == "client_secret_post"
+
+    @pytest.mark.anyio
+    async def test_register_client_none_auth_method_no_compatible(self, oauth_provider: OAuthClientProvider):
+        """Test that registration raises error when no compatible auth methods."""
+        # Set server metadata with unsupported methods only
+        oauth_provider.context.oauth_metadata = OAuthMetadata(
+            issuer=AnyHttpUrl("https://auth.example.com"),
+            authorization_endpoint=AnyHttpUrl("https://auth.example.com/authorize"),
+            token_endpoint=AnyHttpUrl("https://auth.example.com/token"),
+            token_endpoint_auth_methods_supported=["private_key_jwt", "client_secret_jwt"],
+        )
+
+        with pytest.raises(OAuthRegistrationError) as exc_info:
+            await oauth_provider._register_client()
+
+        assert "No compatible authentication methods" in str(exc_info.value)
+        assert "private_key_jwt" in str(exc_info.value)
+
+    @pytest.mark.anyio
     async def test_token_exchange_request_authorization_code(self, oauth_provider: OAuthClientProvider):
         """Test token exchange request building."""
         # Set up required context
@@ -600,6 +681,7 @@ class TestOAuthFallback:
             client_id="test_client",
             client_secret="test_secret",
             redirect_uris=[AnyUrl("http://localhost:3030/callback")],
+            token_endpoint_auth_method="client_secret_post",
         )
 
         request = await oauth_provider._exchange_token_authorization_code("test_auth_code", "test_verifier")
@@ -625,6 +707,7 @@ class TestOAuthFallback:
             client_id="test_client",
             client_secret="test_secret",
             redirect_uris=[AnyUrl("http://localhost:3030/callback")],
+            token_endpoint_auth_method="client_secret_post",
         )
 
         request = await oauth_provider._refresh_token()
@@ -639,6 +722,114 @@ class TestOAuthFallback:
         assert "refresh_token=test_refresh_token" in content
         assert "client_id=test_client" in content
         assert "client_secret=test_secret" in content
+
+    @pytest.mark.anyio
+    async def test_basic_auth_token_exchange(self, oauth_provider: OAuthClientProvider):
+        """Test token exchange with client_secret_basic authentication."""
+        # Set up OAuth metadata to support basic auth
+        oauth_provider.context.oauth_metadata = OAuthMetadata(
+            issuer=AnyHttpUrl("https://auth.example.com"),
+            authorization_endpoint=AnyHttpUrl("https://auth.example.com/authorize"),
+            token_endpoint=AnyHttpUrl("https://auth.example.com/token"),
+            token_endpoint_auth_methods_supported=["client_secret_basic", "client_secret_post"],
+        )
+
+        client_id_raw = "test@client"  # Include special character to test URL encoding
+        client_secret_raw = "test:secret"  # Include colon to test URL encoding
+
+        oauth_provider.context.client_info = OAuthClientInformationFull(
+            client_id=client_id_raw,
+            client_secret=client_secret_raw,
+            redirect_uris=[AnyUrl("http://localhost:3030/callback")],
+            token_endpoint_auth_method="client_secret_basic",
+        )
+
+        request = await oauth_provider._exchange_token_authorization_code("test_auth_code", "test_verifier")
+
+        # Should use basic auth (registered method)
+        assert "Authorization" in request.headers
+        assert request.headers["Authorization"].startswith("Basic ")
+
+        # Decode and verify credentials are properly URL-encoded
+        encoded_creds = request.headers["Authorization"][6:]  # Remove "Basic " prefix
+        decoded = base64.b64decode(encoded_creds).decode()
+        client_id, client_secret = decoded.split(":", 1)
+
+        # Check URL encoding was applied
+        assert client_id == "test%40client"  # @ should be encoded as %40
+        assert client_secret == "test%3Asecret"  # : should be encoded as %3A
+
+        # Verify decoded values match original
+        assert unquote(client_id) == client_id_raw
+        assert unquote(client_secret) == client_secret_raw
+
+        # client_secret should NOT be in body for basic auth
+        content = request.content.decode()
+        assert "client_secret=" not in content
+        assert "client_id=test%40client" in content  # client_id still in body
+
+    @pytest.mark.anyio
+    async def test_basic_auth_refresh_token(self, oauth_provider: OAuthClientProvider, valid_tokens: OAuthToken):
+        """Test token refresh with client_secret_basic authentication."""
+        oauth_provider.context.current_tokens = valid_tokens
+
+        # Set up OAuth metadata to only support basic auth
+        oauth_provider.context.oauth_metadata = OAuthMetadata(
+            issuer=AnyHttpUrl("https://auth.example.com"),
+            authorization_endpoint=AnyHttpUrl("https://auth.example.com/authorize"),
+            token_endpoint=AnyHttpUrl("https://auth.example.com/token"),
+            token_endpoint_auth_methods_supported=["client_secret_basic"],
+        )
+
+        client_id = "test_client"
+        client_secret = "test_secret"
+        oauth_provider.context.client_info = OAuthClientInformationFull(
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uris=[AnyUrl("http://localhost:3030/callback")],
+            token_endpoint_auth_method="client_secret_basic",
+        )
+
+        request = await oauth_provider._refresh_token()
+
+        assert "Authorization" in request.headers
+        assert request.headers["Authorization"].startswith("Basic ")
+
+        encoded_creds = request.headers["Authorization"][6:]
+        decoded = base64.b64decode(encoded_creds).decode()
+        assert decoded == f"{client_id}:{client_secret}"
+
+        # client_secret should NOT be in body
+        content = request.content.decode()
+        assert "client_secret=" not in content
+
+    @pytest.mark.anyio
+    async def test_none_auth_method(self, oauth_provider: OAuthClientProvider):
+        """Test 'none' authentication method (public client)."""
+        oauth_provider.context.oauth_metadata = OAuthMetadata(
+            issuer=AnyHttpUrl("https://auth.example.com"),
+            authorization_endpoint=AnyHttpUrl("https://auth.example.com/authorize"),
+            token_endpoint=AnyHttpUrl("https://auth.example.com/token"),
+            token_endpoint_auth_methods_supported=["none"],
+        )
+
+        client_id = "public_client"
+        oauth_provider.context.client_info = OAuthClientInformationFull(
+            client_id=client_id,
+            client_secret=None,  # No secret for public client
+            redirect_uris=[AnyUrl("http://localhost:3030/callback")],
+            token_endpoint_auth_method="none",
+        )
+
+        request = await oauth_provider._exchange_token_authorization_code("test_auth_code", "test_verifier")
+
+        # Should NOT have Authorization header
+        assert "Authorization" not in request.headers
+
+        # Should NOT have client_secret in body
+        content = request.content.decode()
+        assert "client_secret=" not in content
+        assert "client_id=public_client" in content
 
 
 class TestProtectedResourceMetadata:
@@ -756,6 +947,49 @@ class TestRegistrationResponse:
         assert mock_response._aread_called
         # Verify the error message includes the response text
         assert "Registration failed: 400" in str(exc_info.value)
+
+
+class TestCreateClientRegistrationRequest:
+    """Test client registration request creation."""
+
+    def test_uses_registration_endpoint_from_metadata(self):
+        """Test that registration URL comes from metadata when available."""
+        oauth_metadata = OAuthMetadata(
+            issuer=AnyHttpUrl("https://auth.example.com"),
+            authorization_endpoint=AnyHttpUrl("https://auth.example.com/authorize"),
+            token_endpoint=AnyHttpUrl("https://auth.example.com/token"),
+            registration_endpoint=AnyHttpUrl("https://auth.example.com/register"),
+        )
+        client_metadata = OAuthClientMetadata(redirect_uris=[AnyHttpUrl("http://localhost:3000/callback")])
+
+        request = create_client_registration_request(oauth_metadata, client_metadata, "https://auth.example.com")
+
+        assert str(request.url) == "https://auth.example.com/register"
+        assert request.method == "POST"
+
+    def test_falls_back_to_default_register_endpoint_when_no_metadata(self):
+        """Test that registration uses fallback URL when auth_server_metadata is None."""
+        client_metadata = OAuthClientMetadata(redirect_uris=[AnyHttpUrl("http://localhost:3000/callback")])
+
+        request = create_client_registration_request(None, client_metadata, "https://auth.example.com")
+
+        assert str(request.url) == "https://auth.example.com/register"
+        assert request.method == "POST"
+
+    def test_falls_back_when_metadata_has_no_registration_endpoint(self):
+        """Test fallback when metadata exists but lacks registration_endpoint."""
+        oauth_metadata = OAuthMetadata(
+            issuer=AnyHttpUrl("https://auth.example.com"),
+            authorization_endpoint=AnyHttpUrl("https://auth.example.com/authorize"),
+            token_endpoint=AnyHttpUrl("https://auth.example.com/token"),
+            # No registration_endpoint
+        )
+        client_metadata = OAuthClientMetadata(redirect_uris=[AnyHttpUrl("http://localhost:3000/callback")])
+
+        request = create_client_registration_request(oauth_metadata, client_metadata, "https://auth.example.com")
+
+        assert str(request.url) == "https://auth.example.com/register"
+        assert request.method == "POST"
 
 
 class TestAuthFlow:
@@ -1103,10 +1337,10 @@ def test_build_metadata(
             "registration_endpoint": Is(registration_endpoint),
             "scopes_supported": ["read", "write", "admin"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
-            "token_endpoint_auth_methods_supported": ["client_secret_post"],
+            "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
             "service_documentation": Is(service_documentation_url),
             "revocation_endpoint": Is(revocation_endpoint),
-            "revocation_endpoint_auth_methods_supported": ["client_secret_post"],
+            "revocation_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
             "code_challenge_methods_supported": ["S256"],
         }
     )
@@ -1596,3 +1830,296 @@ class TestWWWAuthenticate:
 
         result = extract_field_from_www_auth(init_response, field_name)
         assert result is None, f"Should return None for {description}"
+
+
+class TestCIMD:
+    """Test Client ID Metadata Document (CIMD) support."""
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            # Valid CIMD URLs
+            ("https://example.com/client", True),
+            ("https://example.com/client-metadata.json", True),
+            ("https://example.com/path/to/client", True),
+            ("https://example.com:8443/client", True),
+            # Invalid URLs - HTTP (not HTTPS)
+            ("http://example.com/client", False),
+            # Invalid URLs - root path
+            ("https://example.com", False),
+            ("https://example.com/", False),
+            # Invalid URLs - None or empty
+            (None, False),
+            ("", False),
+            # Invalid URLs - malformed (triggers urlparse exception)
+            ("http://[::1/foo/", False),
+        ],
+    )
+    def test_is_valid_client_metadata_url(self, url: str | None, expected: bool):
+        """Test CIMD URL validation."""
+        assert is_valid_client_metadata_url(url) == expected
+
+    def test_should_use_client_metadata_url_when_server_supports(self):
+        """Test that CIMD is used when server supports it and URL is provided."""
+        oauth_metadata = OAuthMetadata(
+            issuer=AnyHttpUrl("https://auth.example.com"),
+            authorization_endpoint=AnyHttpUrl("https://auth.example.com/authorize"),
+            token_endpoint=AnyHttpUrl("https://auth.example.com/token"),
+            client_id_metadata_document_supported=True,
+        )
+        assert should_use_client_metadata_url(oauth_metadata, "https://example.com/client") is True
+
+    def test_should_not_use_client_metadata_url_when_server_does_not_support(self):
+        """Test that CIMD is not used when server doesn't support it."""
+        oauth_metadata = OAuthMetadata(
+            issuer=AnyHttpUrl("https://auth.example.com"),
+            authorization_endpoint=AnyHttpUrl("https://auth.example.com/authorize"),
+            token_endpoint=AnyHttpUrl("https://auth.example.com/token"),
+            client_id_metadata_document_supported=False,
+        )
+        assert should_use_client_metadata_url(oauth_metadata, "https://example.com/client") is False
+
+    def test_should_not_use_client_metadata_url_when_not_provided(self):
+        """Test that CIMD is not used when no URL is provided."""
+        oauth_metadata = OAuthMetadata(
+            issuer=AnyHttpUrl("https://auth.example.com"),
+            authorization_endpoint=AnyHttpUrl("https://auth.example.com/authorize"),
+            token_endpoint=AnyHttpUrl("https://auth.example.com/token"),
+            client_id_metadata_document_supported=True,
+        )
+        assert should_use_client_metadata_url(oauth_metadata, None) is False
+
+    def test_should_not_use_client_metadata_url_when_no_metadata(self):
+        """Test that CIMD is not used when OAuth metadata is None."""
+        assert should_use_client_metadata_url(None, "https://example.com/client") is False
+
+    def test_create_client_info_from_metadata_url(self):
+        """Test creating client info from CIMD URL."""
+        client_info = create_client_info_from_metadata_url(
+            "https://example.com/client",
+            redirect_uris=[AnyUrl("http://localhost:3030/callback")],
+        )
+        assert client_info.client_id == "https://example.com/client"
+        assert client_info.token_endpoint_auth_method == "none"
+        assert client_info.redirect_uris == [AnyUrl("http://localhost:3030/callback")]
+        assert client_info.client_secret is None
+
+    def test_oauth_provider_with_valid_client_metadata_url(
+        self, client_metadata: OAuthClientMetadata, mock_storage: MockTokenStorage
+    ):
+        """Test OAuthClientProvider initialization with valid client_metadata_url."""
+
+        async def redirect_handler(url: str) -> None:
+            pass  # pragma: no cover
+
+        async def callback_handler() -> tuple[str, str | None]:
+            return "test_auth_code", "test_state"  # pragma: no cover
+
+        provider = OAuthClientProvider(
+            server_url="https://api.example.com/v1/mcp",
+            client_metadata=client_metadata,
+            storage=mock_storage,
+            redirect_handler=redirect_handler,
+            callback_handler=callback_handler,
+            client_metadata_url="https://example.com/client",
+        )
+        assert provider.context.client_metadata_url == "https://example.com/client"
+
+    def test_oauth_provider_with_invalid_client_metadata_url_raises_error(
+        self, client_metadata: OAuthClientMetadata, mock_storage: MockTokenStorage
+    ):
+        """Test OAuthClientProvider raises error for invalid client_metadata_url."""
+
+        async def redirect_handler(url: str) -> None:
+            pass  # pragma: no cover
+
+        async def callback_handler() -> tuple[str, str | None]:
+            return "test_auth_code", "test_state"  # pragma: no cover
+
+        with pytest.raises(ValueError) as exc_info:
+            OAuthClientProvider(
+                server_url="https://api.example.com/v1/mcp",
+                client_metadata=client_metadata,
+                storage=mock_storage,
+                redirect_handler=redirect_handler,
+                callback_handler=callback_handler,
+                client_metadata_url="http://example.com/client",  # HTTP instead of HTTPS
+            )
+        assert "HTTPS URL with a non-root pathname" in str(exc_info.value)
+
+    @pytest.mark.anyio
+    async def test_auth_flow_uses_cimd_when_server_supports(
+        self, client_metadata: OAuthClientMetadata, mock_storage: MockTokenStorage
+    ):
+        """Test that auth flow uses CIMD URL as client_id when server supports it."""
+
+        async def redirect_handler(url: str) -> None:
+            pass  # pragma: no cover
+
+        async def callback_handler() -> tuple[str, str | None]:
+            return "test_auth_code", "test_state"  # pragma: no cover
+
+        provider = OAuthClientProvider(
+            server_url="https://api.example.com/v1/mcp",
+            client_metadata=client_metadata,
+            storage=mock_storage,
+            redirect_handler=redirect_handler,
+            callback_handler=callback_handler,
+            client_metadata_url="https://example.com/client",
+        )
+
+        provider.context.current_tokens = None
+        provider.context.token_expiry_time = None
+        provider._initialized = True
+
+        test_request = httpx.Request("GET", "https://api.example.com/v1/mcp")
+        auth_flow = provider.async_auth_flow(test_request)
+
+        # First request
+        request = await auth_flow.__anext__()
+        assert "Authorization" not in request.headers
+
+        # Send 401 response
+        response = httpx.Response(401, headers={}, request=test_request)
+
+        # PRM discovery
+        prm_request = await auth_flow.asend(response)
+        prm_response = httpx.Response(
+            200,
+            content=b'{"resource": "https://api.example.com/v1/mcp", "authorization_servers": ["https://auth.example.com"]}',
+            request=prm_request,
+        )
+
+        # OAuth metadata discovery
+        oauth_request = await auth_flow.asend(prm_response)
+        oauth_response = httpx.Response(
+            200,
+            content=(
+                b'{"issuer": "https://auth.example.com", '
+                b'"authorization_endpoint": "https://auth.example.com/authorize", '
+                b'"token_endpoint": "https://auth.example.com/token", '
+                b'"client_id_metadata_document_supported": true}'
+            ),
+            request=oauth_request,
+        )
+
+        # Mock authorization
+        provider._perform_authorization_code_grant = mock.AsyncMock(
+            return_value=("test_auth_code", "test_code_verifier")
+        )
+
+        # Should skip DCR and go directly to token exchange
+        token_request = await auth_flow.asend(oauth_response)
+        assert token_request.method == "POST"
+        assert str(token_request.url) == "https://auth.example.com/token"
+
+        # Verify client_id is the CIMD URL
+        content = token_request.content.decode()
+        assert "client_id=https%3A%2F%2Fexample.com%2Fclient" in content
+
+        # Verify client info was set correctly
+        assert provider.context.client_info is not None
+        assert provider.context.client_info.client_id == "https://example.com/client"
+        assert provider.context.client_info.token_endpoint_auth_method == "none"
+
+        # Complete the flow
+        token_response = httpx.Response(
+            200,
+            content=b'{"access_token": "test_token", "token_type": "Bearer", "expires_in": 3600}',
+            request=token_request,
+        )
+
+        final_request = await auth_flow.asend(token_response)
+        assert final_request.headers["Authorization"] == "Bearer test_token"
+
+        final_response = httpx.Response(200, request=final_request)
+        try:
+            await auth_flow.asend(final_response)
+        except StopAsyncIteration:
+            pass
+
+    @pytest.mark.anyio
+    async def test_auth_flow_falls_back_to_dcr_when_no_cimd_support(
+        self, client_metadata: OAuthClientMetadata, mock_storage: MockTokenStorage
+    ):
+        """Test that auth flow falls back to DCR when server doesn't support CIMD."""
+
+        async def redirect_handler(url: str) -> None:
+            pass  # pragma: no cover
+
+        async def callback_handler() -> tuple[str, str | None]:
+            return "test_auth_code", "test_state"  # pragma: no cover
+
+        provider = OAuthClientProvider(
+            server_url="https://api.example.com/v1/mcp",
+            client_metadata=client_metadata,
+            storage=mock_storage,
+            redirect_handler=redirect_handler,
+            callback_handler=callback_handler,
+            client_metadata_url="https://example.com/client",
+        )
+
+        provider.context.current_tokens = None
+        provider.context.token_expiry_time = None
+        provider._initialized = True
+
+        test_request = httpx.Request("GET", "https://api.example.com/v1/mcp")
+        auth_flow = provider.async_auth_flow(test_request)
+
+        # First request
+        await auth_flow.__anext__()
+
+        # Send 401 response
+        response = httpx.Response(401, headers={}, request=test_request)
+
+        # PRM discovery
+        prm_request = await auth_flow.asend(response)
+        prm_response = httpx.Response(
+            200,
+            content=b'{"resource": "https://api.example.com/v1/mcp", "authorization_servers": ["https://auth.example.com"]}',
+            request=prm_request,
+        )
+
+        # OAuth metadata discovery - server does NOT support CIMD
+        oauth_request = await auth_flow.asend(prm_response)
+        oauth_response = httpx.Response(
+            200,
+            content=(
+                b'{"issuer": "https://auth.example.com", '
+                b'"authorization_endpoint": "https://auth.example.com/authorize", '
+                b'"token_endpoint": "https://auth.example.com/token", '
+                b'"registration_endpoint": "https://auth.example.com/register"}'
+            ),
+            request=oauth_request,
+        )
+
+        # Should proceed to DCR instead of skipping it
+        registration_request = await auth_flow.asend(oauth_response)
+        assert registration_request.method == "POST"
+        assert str(registration_request.url) == "https://auth.example.com/register"
+
+        # Complete the flow to avoid generator cleanup issues
+        registration_response = httpx.Response(
+            201,
+            content=b'{"client_id": "dcr_client_id", "redirect_uris": ["http://localhost:3030/callback"]}',
+            request=registration_request,
+        )
+
+        # Mock authorization
+        provider._perform_authorization_code_grant = mock.AsyncMock(
+            return_value=("test_auth_code", "test_code_verifier")
+        )
+
+        token_request = await auth_flow.asend(registration_response)
+        token_response = httpx.Response(
+            200,
+            content=b'{"access_token": "test_token", "token_type": "Bearer", "expires_in": 3600}',
+            request=token_request,
+        )
+
+        final_request = await auth_flow.asend(token_response)
+        final_response = httpx.Response(200, request=final_request)
+        try:
+            await auth_flow.asend(final_response)
+        except StopAsyncIteration:
+            pass

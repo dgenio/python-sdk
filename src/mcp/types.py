@@ -146,6 +146,10 @@ class JSONRPCResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+# MCP-specific error codes in the range [-32000, -32099]
+URL_ELICITATION_REQUIRED = -32042
+"""Error code indicating that a URL mode elicitation is required before the request can be processed."""
+
 # SDK error codes
 CONNECTION_CLOSED = -32000
 # REQUEST_TIMEOUT = -32001  # the typescript sdk uses this
@@ -250,15 +254,70 @@ class RootsCapability(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-class SamplingCapability(BaseModel):
-    """Capability for sampling operations."""
+class SamplingContextCapability(BaseModel):
+    """
+    Capability for context inclusion during sampling.
+
+    Indicates support for non-'none' values in the includeContext parameter.
+    SOFT-DEPRECATED: New implementations should use tools parameter instead.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+
+class SamplingToolsCapability(BaseModel):
+    """
+    Capability indicating support for tool calling during sampling.
+
+    When present in ClientCapabilities.sampling, indicates that the client
+    supports the tools and toolChoice parameters in sampling requests.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+
+class FormElicitationCapability(BaseModel):
+    """Capability for form mode elicitation."""
+
+    model_config = ConfigDict(extra="allow")
+
+
+class UrlElicitationCapability(BaseModel):
+    """Capability for URL mode elicitation."""
 
     model_config = ConfigDict(extra="allow")
 
 
 class ElicitationCapability(BaseModel):
-    """Capability for elicitation operations."""
+    """Capability for elicitation operations.
 
+    Clients must support at least one mode (form or url).
+    """
+
+    form: FormElicitationCapability | None = None
+    """Present if the client supports form mode elicitation."""
+
+    url: UrlElicitationCapability | None = None
+    """Present if the client supports URL mode elicitation."""
+
+    model_config = ConfigDict(extra="allow")
+
+
+class SamplingCapability(BaseModel):
+    """
+    Sampling capability structure, allowing fine-grained capability advertisement.
+    """
+
+    context: SamplingContextCapability | None = None
+    """
+    Present if the client supports non-'none' values for includeContext parameter.
+    SOFT-DEPRECATED: New implementations should use tools parameter instead.
+    """
+    tools: SamplingToolsCapability | None = None
+    """
+    Present if the client supports tools and toolChoice parameters in sampling requests.
+    Presence indicates full tool calling support during sampling.
+    """
     model_config = ConfigDict(extra="allow")
 
 
@@ -268,7 +327,10 @@ class ClientCapabilities(BaseModel):
     experimental: dict[str, dict[str, Any]] | None = None
     """Experimental, non-standard capabilities that the client supports."""
     sampling: SamplingCapability | None = None
-    """Present if the client supports sampling from an LLM."""
+    """
+    Present if the client supports sampling from an LLM.
+    Can contain fine-grained capabilities like context and tools support.
+    """
     elicitation: ElicitationCapability | None = None
     """Present if the client supports elicitation from the user."""
     roots: RootsCapability | None = None
@@ -742,12 +804,96 @@ class AudioContent(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class ToolUseContent(BaseModel):
+    """
+    Content representing an assistant's request to invoke a tool.
+
+    This content type appears in assistant messages when the LLM wants to call a tool
+    during sampling. The server should execute the tool and return a ToolResultContent
+    in the next user message.
+    """
+
+    type: Literal["tool_use"]
+    """Discriminator for tool use content."""
+
+    name: str
+    """The name of the tool to invoke. Must match a tool name from the request's tools array."""
+
+    id: str
+    """Unique identifier for this tool call, used to correlate with ToolResultContent."""
+
+    input: dict[str, Any]
+    """Arguments to pass to the tool. Must conform to the tool's inputSchema."""
+
+    meta: dict[str, Any] | None = Field(alias="_meta", default=None)
+    """
+    See [MCP specification](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/47339c03c143bb4ec01a26e721a1b8fe66634ebe/docs/specification/draft/basic/index.mdx#general-fields)
+    for notes on _meta usage.
+    """
+    model_config = ConfigDict(extra="allow")
+
+
+class ToolResultContent(BaseModel):
+    """
+    Content representing the result of a tool execution.
+
+    This content type appears in user messages as a response to a ToolUseContent
+    from the assistant. It contains the output of executing the requested tool.
+    """
+
+    type: Literal["tool_result"]
+    """Discriminator for tool result content."""
+
+    toolUseId: str
+    """The unique identifier that corresponds to the tool call's id field."""
+
+    content: list["ContentBlock"] = []
+    """
+    A list of content objects representing the tool result.
+    Defaults to empty list if not provided.
+    """
+
+    structuredContent: dict[str, Any] | None = None
+    """
+    Optional structured tool output that matches the tool's outputSchema (if defined).
+    """
+
+    isError: bool | None = None
+    """Whether the tool execution resulted in an error."""
+
+    meta: dict[str, Any] | None = Field(alias="_meta", default=None)
+    """
+    See [MCP specification](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/47339c03c143bb4ec01a26e721a1b8fe66634ebe/docs/specification/draft/basic/index.mdx#general-fields)
+    for notes on _meta usage.
+    """
+    model_config = ConfigDict(extra="allow")
+
+
+SamplingMessageContentBlock: TypeAlias = TextContent | ImageContent | AudioContent | ToolUseContent | ToolResultContent
+"""Content block types allowed in sampling messages."""
+
+
 class SamplingMessage(BaseModel):
     """Describes a message issued to or received from an LLM API."""
 
     role: Role
-    content: TextContent | ImageContent | AudioContent
+    content: SamplingMessageContentBlock | list[SamplingMessageContentBlock]
+    """
+    Message content. Can be a single content block or an array of content blocks
+    for multi-modal messages and tool interactions.
+    """
+    meta: dict[str, Any] | None = Field(alias="_meta", default=None)
+    """
+    See [MCP specification](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/47339c03c143bb4ec01a26e721a1b8fe66634ebe/docs/specification/draft/basic/index.mdx#general-fields)
+    for notes on _meta usage.
+    """
     model_config = ConfigDict(extra="allow")
+
+    @property
+    def content_as_list(self) -> list[SamplingMessageContentBlock]:
+        """Returns the content as a list of content blocks, regardless of whether
+        it was originally a single block or a list."""
+        return self.content if isinstance(self.content, list) else [self.content]
 
 
 class EmbeddedResource(BaseModel):
@@ -1035,6 +1181,25 @@ class ModelPreferences(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class ToolChoice(BaseModel):
+    """
+    Controls tool usage behavior during sampling.
+
+    Allows the server to specify whether and how the LLM should use tools
+    in its response.
+    """
+
+    mode: Literal["auto", "required", "none"] | None = None
+    """
+    Controls when tools are used:
+    - "auto": Model decides whether to use tools (default)
+    - "required": Model MUST use at least one tool before completing
+    - "none": Model should not use tools
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+
 class CreateMessageRequestParams(RequestParams):
     """Parameters for creating a message."""
 
@@ -1057,6 +1222,16 @@ class CreateMessageRequestParams(RequestParams):
     stopSequences: list[str] | None = None
     metadata: dict[str, Any] | None = None
     """Optional metadata to pass through to the LLM provider."""
+    tools: list["Tool"] | None = None
+    """
+    Tool definitions for the LLM to use during sampling.
+    Requires clientCapabilities.sampling.tools to be present.
+    """
+    toolChoice: ToolChoice | None = None
+    """
+    Controls tool usage behavior.
+    Requires clientCapabilities.sampling.tools and the tools parameter to be present.
+    """
     model_config = ConfigDict(extra="allow")
 
 
@@ -1067,18 +1242,32 @@ class CreateMessageRequest(Request[CreateMessageRequestParams, Literal["sampling
     params: CreateMessageRequestParams
 
 
-StopReason = Literal["endTurn", "stopSequence", "maxTokens"] | str
+StopReason = Literal["endTurn", "stopSequence", "maxTokens", "toolUse"] | str
 
 
 class CreateMessageResult(Result):
     """The client's response to a sampling/create_message request from the server."""
 
     role: Role
-    content: TextContent | ImageContent | AudioContent
+    """The role of the message sender (typically 'assistant' for LLM responses)."""
+    content: SamplingMessageContentBlock | list[SamplingMessageContentBlock]
+    """
+    Response content. May be a single content block or an array.
+    May include ToolUseContent if stopReason is 'toolUse'.
+    """
     model: str
     """The name of the model that generated the message."""
     stopReason: StopReason | None = None
-    """The reason why sampling stopped, if known."""
+    """
+    The reason why sampling stopped, if known.
+    'toolUse' indicates the model wants to use a tool.
+    """
+
+    @property
+    def content_as_list(self) -> list[SamplingMessageContentBlock]:
+        """Returns the content as a list of content blocks, regardless of whether
+        it was originally a single block or a list."""
+        return self.content if isinstance(self.content, list) else [self.content]
 
 
 class ResourceTemplateReference(BaseModel):
@@ -1247,6 +1436,32 @@ class CancelledNotification(Notification[CancelledNotificationParams, Literal["n
     params: CancelledNotificationParams
 
 
+class ElicitCompleteNotificationParams(NotificationParams):
+    """Parameters for elicitation completion notifications."""
+
+    elicitationId: str
+    """The unique identifier of the elicitation that was completed."""
+
+    model_config = ConfigDict(extra="allow")
+
+
+class ElicitCompleteNotification(
+    Notification[ElicitCompleteNotificationParams, Literal["notifications/elicitation/complete"]]
+):
+    """
+    A notification from the server to the client, informing it that a URL mode
+    elicitation has been completed.
+
+    Clients MAY use the notification to automatically retry requests that received a
+    URLElicitationRequiredError, update the user interface, or otherwise continue
+    an interaction. However, because delivery of the notification is not guaranteed,
+    clients must not wait indefinitely for a notification from the server.
+    """
+
+    method: Literal["notifications/elicitation/complete"] = "notifications/elicitation/complete"
+    params: ElicitCompleteNotificationParams
+
+
 class ClientRequest(
     RootModel[
         PingRequest
@@ -1278,12 +1493,56 @@ ElicitRequestedSchema: TypeAlias = dict[str, Any]
 """Schema for elicitation requests."""
 
 
-class ElicitRequestParams(RequestParams):
-    """Parameters for elicitation requests."""
+class ElicitRequestFormParams(RequestParams):
+    """Parameters for form mode elicitation requests.
+
+    Form mode collects non-sensitive information from the user via an in-band form
+    rendered by the client.
+    """
+
+    mode: Literal["form"] = "form"
+    """The elicitation mode (always "form" for this type)."""
 
     message: str
+    """The message to present to the user describing what information is being requested."""
+
     requestedSchema: ElicitRequestedSchema
+    """
+    A restricted subset of JSON Schema defining the structure of expected response.
+    Only top-level properties are allowed, without nesting.
+    """
+
     model_config = ConfigDict(extra="allow")
+
+
+class ElicitRequestURLParams(RequestParams):
+    """Parameters for URL mode elicitation requests.
+
+    URL mode directs users to external URLs for sensitive out-of-band interactions
+    like OAuth flows, credential collection, or payment processing.
+    """
+
+    mode: Literal["url"] = "url"
+    """The elicitation mode (always "url" for this type)."""
+
+    message: str
+    """The message to present to the user explaining why the interaction is needed."""
+
+    url: str
+    """The URL that the user should navigate to."""
+
+    elicitationId: str
+    """
+    The ID of the elicitation, which must be unique within the context of the server.
+    The client MUST treat this ID as an opaque value.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+
+# Union type for elicitation request parameters
+ElicitRequestParams: TypeAlias = ElicitRequestURLParams | ElicitRequestFormParams
+"""Parameters for elicitation requests - either form or URL mode."""
 
 
 class ElicitRequest(Request[ElicitRequestParams, Literal["elicitation/create"]]):
@@ -1299,16 +1558,31 @@ class ElicitResult(Result):
     action: Literal["accept", "decline", "cancel"]
     """
     The user action in response to the elicitation.
-    - "accept": User submitted the form/confirmed the action
+    - "accept": User submitted the form/confirmed the action (or consented to URL navigation)
     - "decline": User explicitly declined the action
     - "cancel": User dismissed without making an explicit choice
     """
 
-    content: dict[str, str | int | float | bool | None] | None = None
+    content: dict[str, str | int | float | bool | list[str] | None] | None = None
     """
-    The submitted form data, only present when action is "accept".
-    Contains values matching the requested schema.
+    The submitted form data, only present when action is "accept" in form mode.
+    Contains values matching the requested schema. Values can be strings, integers,
+    booleans, or arrays of strings.
+    For URL mode, this field is omitted.
     """
+
+
+class ElicitationRequiredErrorData(BaseModel):
+    """Error data for URLElicitationRequiredError.
+
+    Servers return this when a request cannot be processed until one or more
+    URL mode elicitations are completed.
+    """
+
+    elicitations: list[ElicitRequestURLParams]
+    """List of URL mode elicitations that must be completed."""
+
+    model_config = ConfigDict(extra="allow")
 
 
 class ClientResult(RootModel[EmptyResult | CreateMessageResult | ListRootsResult | ElicitResult]):
@@ -1328,6 +1602,7 @@ class ServerNotification(
         | ResourceListChangedNotification
         | ToolListChangedNotification
         | PromptListChangedNotification
+        | ElicitCompleteNotification
     ]
 ):
     pass

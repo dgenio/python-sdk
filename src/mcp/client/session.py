@@ -4,7 +4,6 @@ from typing import Any, Protocol, overload
 
 import anyio.lowlevel
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
-from jsonschema import SchemaError, ValidationError, validate
 from pydantic import AnyUrl, TypeAdapter
 from typing_extensions import deprecated
 
@@ -139,7 +138,12 @@ class ClientSession(
     async def initialize(self) -> types.InitializeResult:
         sampling = types.SamplingCapability() if self._sampling_callback is not _default_sampling_callback else None
         elicitation = (
-            types.ElicitationCapability() if self._elicitation_callback is not _default_elicitation_callback else None
+            types.ElicitationCapability(
+                form=types.FormElicitationCapability(),
+                url=types.UrlElicitationCapability(),
+            )
+            if self._elicitation_callback is not _default_elicitation_callback
+            else None
         )
         roots = (
             # TODO: Should this be based on whether we
@@ -376,6 +380,8 @@ class ClientSession(
             logger.warning(f"Tool {name} not listed by server, cannot validate any structured content")
 
         if output_schema is not None:
+            from jsonschema import SchemaError, ValidationError, validate
+
             if result.structuredContent is None:
                 raise RuntimeError(
                     f"Tool {name} has an output schema but did not return structured content"
@@ -551,5 +557,10 @@ class ClientSession(
         match notification.root:
             case types.LoggingMessageNotification(params=params):
                 await self._logging_callback(params)
+            case types.ElicitCompleteNotification(params=params):
+                # Handle elicitation completion notification
+                # Clients MAY use this to retry requests or update UI
+                # The notification contains the elicitationId of the completed elicitation
+                pass
             case _:
                 pass
